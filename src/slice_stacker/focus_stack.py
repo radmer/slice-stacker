@@ -46,23 +46,45 @@ def compute_focus_measure(img: np.ndarray, method: str = "laplacian",
     """
     Compute per-pixel focus measure (sharpness map).
     Returns float32 to save memory vs float64.
+    
+    Methods:
+        laplacian: Absolute Laplacian (fast, but fooled by bokeh)
+        gradient: Sobel gradient magnitude  
+        variance: Local variance
+        edges: Edge-based (best for photos with bokeh, uses local edge density)
     """
     if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     else:
-        gray = img.astype(np.float32)
+        gray = img
+    
+    gray_f = gray.astype(np.float32)
     
     if method == "laplacian":
-        lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=kernel_size)
+        lap = cv2.Laplacian(gray_f, cv2.CV_32F, ksize=kernel_size)
         focus = np.abs(lap)
     elif method == "gradient":
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=kernel_size)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=kernel_size)
+        gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=kernel_size)
+        gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=kernel_size)
         focus = np.sqrt(gx**2 + gy**2)
     elif method == "variance":
-        mean = cv2.blur(gray, (kernel_size, kernel_size))
-        sqr_mean = cv2.blur(gray**2, (kernel_size, kernel_size))
+        mean = cv2.blur(gray_f, (kernel_size, kernel_size))
+        sqr_mean = cv2.blur(gray_f**2, (kernel_size, kernel_size))
         focus = sqr_mean - mean**2
+    elif method == "edges":
+        # Edge-based focus: detects actual edges, not bokeh artifacts
+        # Convert to 8-bit for Canny (works better with its thresholds)
+        gray_8 = (gray / 256).astype(np.uint8) if gray.dtype == np.uint16 else gray
+        
+        # Multi-scale edge detection for robustness
+        edges1 = cv2.Canny(gray_8, 20, 60).astype(np.float32)
+        edges2 = cv2.Canny(gray_8, 40, 120).astype(np.float32)
+        edges = edges1 + edges2
+        
+        # Dilate edges slightly to create regions, then blur for smooth weights
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        edges = cv2.dilate(edges, kernel)
+        focus = cv2.GaussianBlur(edges, (21, 21), 0)
     else:
         raise ValueError(f"Unknown focus method: {method}")
     
@@ -267,16 +289,23 @@ def stack_weighted_streaming(paths: list[Path], focus_method: str, kernel_size: 
 
 
 def stack_pyramid_streaming(paths: list[Path], focus_method: str, kernel_size: int,
-                            levels: int, align: bool, ref_idx: int) -> np.ndarray:
+                            levels: int, align: bool, ref_idx: int,
+                            smooth_radius: int = 5, focus_power: float = 2.0) -> np.ndarray:
     """
     Memory-efficient Laplacian pyramid blending.
     Builds blended pyramid incrementally instead of storing all pyramids.
+    
+    focus_power: Raise focus measures to this power before weighting.
+                 Higher values = sharper selection (less blending).
+                 1.0 = linear weighting, 2.0+ = prefer sharp pixels more strongly.
     """
     n = len(paths)
     shape, dtype = get_image_info(paths)
     h, w = shape[:2]
     is_color = len(shape) == 3
     channels = shape[2] if is_color else 1
+    
+    smooth_ksize = smooth_radius * 2 + 1 if smooth_radius > 0 else 1
     
     # Prepare alignment
     ref_gray = None
@@ -291,7 +320,7 @@ def stack_pyramid_streaming(paths: list[Path], focus_method: str, kernel_size: i
         del ref_img
     
     # Pass 1: Compute focus sum for normalization
-    print(f"Pass 1: Computing focus measures ({focus_method})...")
+    print(f"Pass 1: Computing focus measures ({focus_method}, power={focus_power})...")
     focus_sum = np.zeros((h, w), dtype=np.float64)
     
     for i, p in enumerate(paths):
@@ -308,7 +337,9 @@ def stack_pyramid_streaming(paths: list[Path], focus_method: str, kernel_size: i
                 img = apply_warp(img, warp_matrices[i])
         
         focus = compute_focus_measure(img, focus_method, kernel_size)
-        focus = cv2.GaussianBlur(focus, (31, 31), 0)
+        focus = cv2.GaussianBlur(focus, (smooth_ksize, smooth_ksize), 0)
+        # Apply power to make sharp regions dominate
+        focus = np.power(focus + 1e-10, focus_power)
         focus_sum += focus.astype(np.float64)
         del img, focus
     
@@ -350,9 +381,10 @@ def stack_pyramid_streaming(paths: list[Path], focus_method: str, kernel_size: i
         if align and warp_matrices[i] is not None:
             img = apply_warp(img, warp_matrices[i])
         
-        # Compute weight
+        # Compute weight (must match pass 1 exactly)
         focus = compute_focus_measure(img, focus_method, kernel_size)
-        focus = cv2.GaussianBlur(focus, (31, 31), 0)
+        focus = cv2.GaussianBlur(focus, (smooth_ksize, smooth_ksize), 0)
+        focus = np.power(focus + 1e-10, focus_power)
         weight = focus.astype(np.float64) / focus_sum
         weight_pyr = _build_gaussian_pyramid(weight.astype(np.float32), levels)
         
@@ -438,16 +470,24 @@ Examples:
   %(prog)s IMG_*.tif -o stacked.tif
   %(prog)s *.tif -o out.tif --method pyramid --align
   %(prog)s img1.tif img2.tif img3.tif -o result.tif --focus-measure gradient
+  %(prog)s *.tif -o out.tif --method max  # Sharpest pixel selection (no blending)
+  %(prog)s *.tif -o out.tif --focus-power 4  # More aggressive sharp pixel selection
 
 Stacking methods:
-  max      - Select sharpest pixel from each image (fast, can be harsh)
+  max      - Select sharpest pixel from each image (fast, sharp but can have artifacts)
   weighted - Weighted average by focus measure (smoother)
-  pyramid  - Laplacian pyramid blending (best quality, slower)
+  pyramid  - Laplacian pyramid blending (smooth transitions, default)
 
 Focus measures:
-  laplacian - Laplacian response (good default)
+  edges     - Edge-based detection (default, best for photos with bokeh)
+  laplacian - Laplacian response (fast but fooled by bokeh)
   gradient  - Sobel gradient magnitude
   variance  - Local variance (good for texture)
+
+Tips:
+  - For many images (50+), try --method max or increase --focus-power to 3-4
+  - If result is blurry, increase --focus-power or use --method max
+  - If result has harsh transitions, decrease --focus-power or use pyramid method
         """
     )
     
@@ -458,9 +498,9 @@ Focus measures:
     parser.add_argument("--method", choices=["max", "weighted", "pyramid"],
                         default="pyramid",
                         help="Stacking method (default: pyramid)")
-    parser.add_argument("--focus-measure", choices=["laplacian", "gradient", "variance"],
-                        default="laplacian", dest="focus_measure",
-                        help="Focus measure algorithm (default: laplacian)")
+    parser.add_argument("--focus-measure", choices=["laplacian", "gradient", "variance", "edges"],
+                        default="edges", dest="focus_measure",
+                        help="Focus measure algorithm (default: edges - best for photos)")
     parser.add_argument("--kernel-size", type=int, default=5, dest="kernel_size",
                         help="Kernel size for focus measure (default: 5)")
     parser.add_argument("--align", action="store_true",
@@ -469,8 +509,10 @@ Focus measures:
                         help="Reference image index for alignment (default: middle)")
     parser.add_argument("--pyramid-levels", type=int, default=6, dest="pyramid_levels",
                         help="Pyramid levels for pyramid method (default: 6)")
-    parser.add_argument("--smooth-weights", type=int, default=11, dest="smooth_weights",
-                        help="Gaussian smoothing radius for weight maps (default: 11)")
+    parser.add_argument("--smooth-weights", type=int, default=5, dest="smooth_weights",
+                        help="Gaussian smoothing radius for weight maps (default: 5)")
+    parser.add_argument("--focus-power", type=float, default=2.0, dest="focus_power",
+                        help="Power for focus weighting (higher=sharper selection, default: 2.0)")
     
     args = parser.parse_args()
     
@@ -498,7 +540,8 @@ Focus measures:
                                           args.smooth_weights, args.align, ref_idx)
     elif args.method == "pyramid":
         result = stack_pyramid_streaming(args.images, args.focus_measure, args.kernel_size,
-                                         args.pyramid_levels, args.align, ref_idx)
+                                         args.pyramid_levels, args.align, ref_idx,
+                                         args.smooth_weights, args.focus_power)
     
     # Save result
     tifffile.imwrite(args.output, result, photometric='rgb' if result.ndim == 3 else 'minisblack')
